@@ -1,4 +1,4 @@
-module IO.Runner(Request, Response, run) where
+module IO.Runner(Request, Response, run, map) where
 
 {-| Once you've constructed your IO computation `foo : IO ()`, you
 can run it by adding the following to the file (Foo.elm) you're running:
@@ -24,7 +24,7 @@ import Json.Encode as JSE
 import List exposing ((::))
 import List
 import Result
-import Signal exposing (Signal, (<~), foldp)
+import Signal exposing (Signal, (<~), (~), foldp)
 import String
 import Trampoline
     
@@ -44,6 +44,9 @@ type alias Request = JSD.Value
 type alias Response = JSD.Value
 type alias IOState  = { buffer : String }
 
+type Action = Step Response
+            | Merge (IO ())
+
 start : IOState 
 start = { buffer = "" }
 
@@ -53,6 +56,27 @@ run resps io =
       f resp (io, st, _) = step (deserialize resp) io st
       third (_, _, z)    = z
   in serialize << third <~ foldp f init resps
+
+map : Signal Response -> Signal (IO ()) -> Signal Request
+map resps ios =
+  let init               = (\_ -> IO.pure (), start, [])
+      third (_, _, z)    = z
+      idx s              = foldp (\r (i, _) -> (i + 1, r)) (-1, Nothing) s
+      iacts              = (,) <~ (idx (Just << Step <~ resps)) ~ (idx (Just << Merge <~ ios))
+      fiacts acts state  = let ((fi', f'), (si', s')) = acts
+                               ((fi, f), (si, s), _)  = state
+                               ff                     = if fi == fi' then Nothing else f'
+                               ss                     = if si == si' then Nothing else s'
+                               z                      = List.filterMap identity [ff, ss]
+                           in ((fi', f'), (si', s'), z)
+      macts              = third <~ foldp fiacts ((-1, Nothing), (-1, Nothing), []) iacts
+      seq io io'         = \_ -> IO.seq (io ()) io'
+      fl act (io, st, z) = case act of
+                            Step resp -> step (deserialize resp) io st
+                            Merge io' -> let (x, y, z') = (step Nothing (seq io io') st)
+                                         in  (x, y, List.append z z')
+      f acts iot         = List.foldl fl iot acts
+  in serialize << third <~ foldp f init macts
 
 resDecoder : JSD.Decoder String
 resDecoder = ("Just" := JSD.string)
@@ -93,7 +117,7 @@ writeF = WriteFile
 extractRequests : IO a -> State IOState (List IRequest, () -> IO a)
 extractRequests io = 
   case io of
-    IO.Pure x -> pure ([exit 0], \_ -> IO.Pure x)
+    IO.Pure x -> pure ([], \_ -> IO.Pure x)
     IO.Impure iof -> case iof of
       IO.PutS s k     -> mapSt (mapFst (\rs -> putS s :: rs)) <| pure ([], k)
       IO.WriteF obj k -> mapSt (mapFst (\rs -> writeF obj :: rs)) <| pure ([], k)
